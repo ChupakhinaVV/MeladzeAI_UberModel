@@ -1,160 +1,126 @@
 import torch
 import numpy as np
 from datasets import load_dataset
-from transformers import (
-    AutoTokenizer,
-    AutoModelForSeq2SeqLM,
-    Trainer,
-    TrainingArguments,
-)
+from transformers import (GPT2LMHeadModel, GPT2Tokenizer, Trainer, TrainingArguments)
 from sacrebleu.metrics import CHRF
 
 def main():
-    # 1) Загрузка JSONL: по умолчанию создаётся split 'train'
+    # === Загружаем датасет ===
     ds = load_dataset("json", data_files="meladze.jsonl")
-    # 2) Делим на train/test
     split = ds["train"].train_test_split(test_size=0.1, seed=42)
-    raw_train = split["train"]
-    raw_test  = split["test"]
+    raw_train, raw_test = split["train"], split["test"]
 
-    # 3) Превью первых трёх примеров
-    print("=== Dataset preview (first 3 examples) ===")
-    for i, ex in enumerate(raw_train.select(range(3)), 1):
-        print(f"{i}) prompt: {ex['prompt']!r}")
-        print(f"   text : {ex['text']!r}\n")
-
-    # 4) Токенизатор и модель
-    BASE = "cointegrated/rut5-base"
-    tokenizer = AutoTokenizer.from_pretrained(BASE, use_fast=True)
-    model     = AutoModelForSeq2SeqLM.from_pretrained(BASE)
-    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # === Загружаем модель и токенизатор ===
+    MODEL = "ai-forever/rugpt3medium_based_on_gpt2"
+    tokenizer = GPT2Tokenizer.from_pretrained(MODEL)
+    tokenizer.pad_token = tokenizer.eos_token
+    model = GPT2LMHeadModel.from_pretrained(MODEL)
+    model.resize_token_embeddings(len(tokenizer))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # 5) Функция препроцессинга
-    def preprocess(batch):
-        # убираем ведущие/замыкающие кавычки, если они есть
-        batch["text"] = [t.strip('"') for t in batch["text"]]
-        enc = tokenizer(
-            batch["prompt"],
-            padding="max_length",
+    # === Подготовка данных ===
+    def preprocess(example):
+        full = example["prompt"] + "\n" + example["text"]
+        tokens = tokenizer(
+            full,
             truncation=True,
-            max_length=64,
-        )
-        tgt = tokenizer(
-            batch["text"],
             padding="max_length",
-            truncation=True,
-            max_length=256,
+            max_length=768
         )
-        enc["labels"] = tgt["input_ids"]
-        return enc
+        tokens["labels"] = tokens["input_ids"].copy()
+        return tokens
 
-    tokenized = split.map(
-        preprocess,
-        batched=True,
-        remove_columns=["prompt", "text"]
-    )
+    tokenized = split.map(preprocess, remove_columns=["prompt", "text"])
 
-    # 6) Обучение
-    training_args = TrainingArguments(
-        output_dir="./rut5-meladze",
-        overwrite_output_dir=True,
-        num_train_epochs=10,
+    # === Аргументы обучения ===
+    args = TrainingArguments(
+        output_dir="./gpt3-meladze",
         per_device_train_batch_size=2,
-        learning_rate=2e-5,
-        warmup_steps=50,
+        num_train_epochs=50,
+        learning_rate=8e-5,
         logging_dir="./logs",
-        logging_steps=50,
-        save_steps=200,
-        save_total_limit=2,
+        logging_steps=20,
+        save_steps=500,
+        save_total_limit=1,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="loss",
+        overwrite_output_dir=True
     )
+
+    # === Trainer ===
     trainer = Trainer(
         model=model,
-        args=training_args,
+        args=args,
         train_dataset=tokenized["train"],
         eval_dataset=tokenized["test"],
         tokenizer=tokenizer,
     )
+
     trainer.train()
 
-    # 7) Сохраняем
-    model.save_pretrained("./rut5-meladze")
-    tokenizer.save_pretrained("./rut5-meladze")
+    # === Сохраняем ===
+    model.save_pretrained("./gpt3-meladze")
+    tokenizer.save_pretrained("./gpt3-meladze")
 
-    # 8) Генератор
-    def generate(prompt: str, max_new_tokens: int = 120) -> str:
-        inputs = tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=64
-        ).to(device)
-        out = model.generate(
+    # === Генерация коротких текстов ===
+    def generate(prompt, max_new_tokens=40):
+        inputs = tokenizer(prompt + "\n", return_tensors="pt").to(device)
+        output = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=True,
-            top_k=50,
-            top_p=0.95,
-            temperature=0.8,
-            repetition_penalty=1.1,
+            top_k=40,
+            top_p=0.92,
+            temperature=1.1,
+            repetition_penalty=1.2,
+            eos_token_id=tokenizer.eos_token_id
         )
-        return tokenizer.decode(out[0], skip_special_tokens=True)
+        return tokenizer.decode(output[0], skip_special_tokens=True)
 
-    # 9) Пара примеров
-    for title in ["Иностранец", "Сэра"]:
-        print(f"\n=== Пример для «{title}» ===")
+    # === Примеры ===
+    for title in ["Полюбил", "Сэра", "Иностранец"]:
+        print(f"\n=== Пример для '{title}' ===")
         print(generate(f"generate_song: {title}"))
 
-    # 10) Метрики на test
+    # === Метрики ===
     refs, hyps = [], []
     for ex in raw_test:
         hyp = generate(ex["prompt"])
         refs.append([ex["text"]])
         hyps.append(hyp)
 
-    print("\n=== Evaluation on test set ===")
-    chrf = CHRF()
-    print("chrF++      ", chrf.corpus_score(hyps, refs).score)
+    print("\nchrF++     ", CHRF().corpus_score(hyps, refs).score)
 
     def distinct_n(corpus, n):
         grams, total = set(), 0
         for txt in corpus:
             toks = txt.split()
-            total += max(len(toks)-n+1, 0)
-            for i in range(len(toks)-n+1):
-                grams.add(tuple(toks[i:i+n]))
-        return len(grams)/total if total>0 else 0
+            total += max(len(toks) - n + 1, 0)
+            for i in range(len(toks) - n + 1):
+                grams.add(tuple(toks[i:i + n]))
+        return len(grams) / total if total > 0 else 0
 
-    print("Distinct-1  ", distinct_n(hyps, 1))
-    print("Distinct-2  ", distinct_n(hyps, 2))
+    print("Distinct-1 ", distinct_n(hyps, 1))
+    print("Distinct-2 ", distinct_n(hyps, 2))
 
-    train_tok = set()
-    for t in raw_train["text"]:
-        train_tok.update(t.split())
-    gen_tok = set(w for hyp in hyps for w in hyp.split())
-    novelty = 100 * len(gen_tok - train_tok) / len(gen_tok) if gen_tok else 0
-    print("Novelty (%) ", novelty)
+    train_tokens = set(" ".join(raw_train["text"]).split())
+    gen_tokens   = set(" ".join(hyps).split())
+    novelty = 100 * len(gen_tokens - train_tokens) / len(gen_tokens)
+    print("Novelty %  ", novelty)
 
+    # Perplexity
     model.eval()
     losses = []
     for ex in raw_test:
         with torch.no_grad():
-            enc = tokenizer(
-                ex["prompt"],
-                return_tensors="pt",
-                truncation=True,
-                max_length=64
-            ).to(device)
-            lbls = tokenizer(
-                ex["text"],
-                return_tensors="pt",
-                truncation=True,
-                max_length=256
-            ).input_ids.to(device)
-            out = model(**enc, labels=lbls)
+            full   = ex["prompt"] + "\n" + ex["text"]
+            tokens = tokenizer(full, return_tensors="pt", truncation=True, max_length=512).to(device)
+            out    = model(**tokens, labels=tokens["input_ids"])
             losses.append(out.loss.item())
-    ppl = float(np.exp(np.mean(losses)))
-    print("Perplexity  ", ppl)
+    print("Perplexity ", float(np.exp(np.mean(losses))))
 
 if __name__ == "__main__":
     main()
