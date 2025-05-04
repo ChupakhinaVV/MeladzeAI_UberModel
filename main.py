@@ -119,8 +119,6 @@ def generate_loop():
             break
         prompt = f"{user_input}"
         result = generate(tokenizer,device,model,prompt)
-
-        print(f"\n📝 Запрос:\n{user_input}")
         print(f"\n📝 Сгенерировано:\n{result}")
 
 def main():
